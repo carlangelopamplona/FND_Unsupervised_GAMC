@@ -29,7 +29,7 @@ For the program start, you could run the script:
 python main_graph.py --dataset DATASETNAME --use_cfg
 ```
 # Reference
-If you make advantage of MSGCL in your research, please cite the following in your manuscript:
+If you make advantage of GAMC in your research, please cite the following in your manuscript:
 
 ```
 @inproceedings{yin2024gamc,
