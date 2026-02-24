@@ -3,7 +3,9 @@
 
 <h1> GAMC: An Unsupervised Method for Fake News Detection using Graph Autoencoder with Masking </h1>
 
-GAMC is an unsupervised fake news detection technique using the graph autoencoder with masking and contrastive learning.
+GAMC is an unsupervised fake news detection technique using the graph autoencoder with masking and contrastive learning. The code related to the paper below：
+
+Shu Yin, Peican Zhu, Lianwei Wu, Chao Gao, Zhen Wang, GAMC: An Unsupervised Method for Fake News Detection using Graph Autoencoder with Masking, Proceedings of the AAAI conference on artificial intelligence, 2024, 38(1): 347-355.
 
 
 
@@ -26,6 +28,19 @@ For the program start, you could run the script:
 ```bash
 python main_graph.py --dataset DATASETNAME --use_cfg
 ```
+# Reference
+If you make advantage of MSGCL in your research, please cite the following in your manuscript:
 
+```
+@inproceedings{yin2024gamc,
+  title={Gamc: an unsupervised method for fake news detection using graph autoencoder with masking},
+  author={Yin, Shu and Zhu, Peican and Wu, Lianwei and Gao, Chao and Wang, Zhen},
+  booktitle={Proceedings of the AAAI conference on artificial intelligence},
+  volume={38},
+  number={1},
+  pages={347--355},
+  year={2024}
+}
+```
 
 
