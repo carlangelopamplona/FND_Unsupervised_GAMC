@@ -1,0 +1,4 @@
+| Dataset    | Method   |   Accuracy (Micro-F1) |    Std |   Runs |
+|:-----------|:---------|----------------------:|-------:|-------:|
+| Politifact | GAMC     |                0.8576 | 0.0102 |      9 |
+| GossipCop  | GAMC     |                0.876  | 0.005  |      9 |

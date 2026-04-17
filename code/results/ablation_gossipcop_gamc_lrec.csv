@@ -1,0 +1,3 @@
+dataset,ablation,run,accuracy,f1_micro,accuracy_std,std
+gossipcop,gamc_lrec,0,0.8768320040714922,0.8768320040714922,,
+gossipcop,gamc_lrec,mean,0.8768320040714922,0.8768320040714922,0.0,0.0

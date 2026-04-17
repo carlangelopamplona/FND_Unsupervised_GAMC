@@ -95,6 +95,10 @@ class PreModel(nn.Module):
             replace_rate: float = 0.1,
             alpha_l: float = 2,
             concat_hidden: bool = False,
+                use_augmentation: bool = True,
+                use_reconstruction_loss: bool = True,
+                use_contrastive_loss: bool = True,
+                num_aug_views: int = 2,
          ):
         super(PreModel, self).__init__()
         self._mask_rate = mask_rate
@@ -106,6 +110,10 @@ class PreModel(nn.Module):
         
         self._replace_rate = replace_rate
         self._mask_token_rate = 1 - self._replace_rate
+        self._use_augmentation = use_augmentation
+        self._use_reconstruction_loss = use_reconstruction_loss
+        self._use_contrastive_loss = use_contrastive_loss
+        self._num_aug_views = max(1, int(num_aug_views))
 
         assert num_hidden % nhead == 0
         assert num_hidden % nhead_out == 0
@@ -248,10 +256,41 @@ class PreModel(nn.Module):
         return out_x, (mask_nodes, keep_nodes)
 
     def forward(self, x, edge_index, news_node):
-        # ---- attribute reconstruction ----
         loss = self.mask_attr_prediction_with_contrastive(x, edge_index, news_node)
         loss_item = {"loss": loss.item()}
         return loss, loss_item
+
+    def _build_view(self, x, edge_index, news_node):
+        if self._use_augmentation:
+            use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(x, news_node, self._mask_rate)
+            if self._drop_edge_rate > 0:
+                use_edge_index, _ = dropout_edge(edge_index, self._drop_edge_rate)
+            else:
+                use_edge_index = edge_index
+        else:
+            use_x = x
+            use_edge_index = edge_index
+            num_nodes = x.shape[0]
+            mask_nodes = torch.arange(num_nodes, device=x.device)
+            keep_nodes = mask_nodes
+
+        enc_rep, all_hidden = self.encoder(use_x, use_edge_index, return_hidden=True)
+        if self._concat_hidden:
+            enc_rep = torch.cat(all_hidden, dim=1)
+
+        rep = self.encoder_to_decoder(enc_rep)
+        if self._decoder_type not in ("mlp", "linear") and self._use_augmentation:
+            rep[mask_nodes] = 0
+
+        if self._decoder_type in ("mlp", "linear"):
+            recon = self.decoder(rep)
+        else:
+            recon = self.decoder(rep, use_edge_index)
+
+        return {
+            "mask_nodes": mask_nodes,
+            "recon": recon,
+        }
     
     def mask_attr_prediction(self, x, edge_index, news_node):
         use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(x, news_node, self._mask_rate)
@@ -287,56 +326,33 @@ class PreModel(nn.Module):
         return loss
 
     def mask_attr_prediction_with_contrastive(self, x, edge_index, news_node):
-        use_x_1, (mask_nodes_1, keep_nodes_1) = self.encoding_mask_noise(x, news_node, self._mask_rate)
-        use_x_2, (mask_nodes_2, keep_nodes_2) = self.encoding_mask_noise(x, news_node, self._mask_rate)
+        num_views = 2 if self._use_contrastive_loss else 1
+        num_views = min(num_views, self._num_aug_views) if self._num_aug_views > 0 else num_views
+        num_views = max(1, num_views)
 
-        if self._drop_edge_rate > 0:
-            use_edge_index, masked_edges = dropout_edge(edge_index, self._drop_edge_rate)
-            # use_edge_index = add_self_loops(use_edge_index)[0]
-        else:
-            use_edge_index = edge_index
+        views = [self._build_view(x, edge_index, news_node) for _ in range(num_views)]
 
-        enc_rep_1, all_hidden_1 = self.encoder(use_x_1, use_edge_index, return_hidden=True)
-        enc_rep_2, all_hidden_2 = self.encoder(use_x_2, use_edge_index, return_hidden=True)
+        losses = []
 
-        if self._concat_hidden:
-            enc_rep_1 = torch.cat(all_hidden_1, dim=1)
-            enc_rep_2 = torch.cat(all_hidden_1, dim=1)
+        if self._use_reconstruction_loss:
+            rec_losses = []
+            for view in views:
+                mask_nodes = view["mask_nodes"]
+                x_init = x[mask_nodes]
+                x_rec = view["recon"][mask_nodes]
+                rec_losses.append(self.criterion(x_rec, x_init))
+            losses.append(torch.stack(rec_losses).mean())
 
-        # ---- attribute reconstruction ----
-        rep_1 = self.encoder_to_decoder(enc_rep_1)
-        rep_2 = self.encoder_to_decoder(enc_rep_2)
+        if self._use_contrastive_loss and len(views) >= 2:
+            rec_1 = global_mean_pool(views[0]["recon"], None)[0]
+            rec_2 = global_mean_pool(views[1]["recon"], None)[0]
+            loss_c = torch.cosine_similarity(rec_1, rec_2, dim=0)
+            losses.append(-loss_c)
 
-        if self._decoder_type not in ("mlp", "linear"):
-            # * remask, re-mask
-            rep_1[mask_nodes_1] = 0
-            rep_2[mask_nodes_1] = 0
+        if not losses:
+            return torch.tensor(0.0, device=x.device, requires_grad=True)
 
-        if self._decoder_type in ("mlp", "linear"):
-            recon_1 = self.decoder(rep_1)
-            recon_2 = self.decoder(rep_2)
-        else:
-            recon_1 = self.decoder(rep_1, use_edge_index)
-            recon_2 = self.decoder(rep_2, use_edge_index)
-
-        x_init_1 = x[mask_nodes_1]
-        x_init_2 = x[mask_nodes_2]
-        x_rec_1 = recon_1[mask_nodes_1]
-        x_rec_2 = recon_2[mask_nodes_2]
-
-        num_graph = torch.sum(news_node).int()
-
-        # kl_divergence = 0.5 / x_rec_1.size(0) * (
-        #             1 + 2 * all_hidden_1[-2][mask_nodes_1] - all_hidden_1[-3][mask_nodes_1] ** 2 - torch.exp(
-        #         all_hidden_1[-2][mask_nodes_1])).sum(
-        #     1).mean()
-        rec_1 = global_mean_pool(recon_1, None)[0]
-        rec_2 = global_mean_pool(recon_2, None)[0]
-        loss_c = torch.cosine_similarity(rec_1, rec_2, dim=0)
-        # loss_c = torch.mean(loss_c)
-        loss = self.criterion(x_rec_1, x_init_1) + self.criterion(x_rec_2, x_init_2)
-        loss = - loss_c
-        return loss
+        return sum(losses)
 
     def embed(self, x, edge_index):
         rep = self.encoder(x, edge_index)

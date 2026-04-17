@@ -23,6 +23,10 @@ def build_model(args):
     alpha_l = args.alpha_l
     concat_hidden = args.concat_hidden
     num_features = args.num_features
+    use_augmentation = getattr(args, "use_augmentation", True)
+    use_reconstruction_loss = getattr(args, "use_reconstruction_loss", True)
+    use_contrastive_loss = getattr(args, "use_contrastive_loss", True)
+    num_aug_views = getattr(args, "num_aug_views", 2)
 
 
     model = PreModel(
@@ -45,5 +49,9 @@ def build_model(args):
         replace_rate=replace_rate,
         alpha_l=alpha_l,
         concat_hidden=concat_hidden,
+        use_augmentation=use_augmentation,
+        use_reconstruction_loss=use_reconstruction_loss,
+        use_contrastive_loss=use_contrastive_loss,
+        num_aug_views=num_aug_views,
     )
     return model

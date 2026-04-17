@@ -1,0 +1,3 @@
+dataset,ablation,run,accuracy,f1_micro,accuracy_std,std
+politifact,gmac_aug,0,0.6873991935483872,0.6873991935483872,,
+politifact,gmac_aug,mean,0.6873991935483872,0.6873991935483872,0.0,0.0

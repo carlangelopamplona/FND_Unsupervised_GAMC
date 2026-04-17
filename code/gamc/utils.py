@@ -43,6 +43,13 @@ def build_args():
     parser.add_argument("--dataset", type=str, default="politifact")
     parser.add_argument("--feature", type=str, default="bert")
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--gpu_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "rocm", "directml", "cuda", "cpu"],
+        help="GPU backend selection. auto tries ROCm/CUDA first, then DirectML.",
+    )
     parser.add_argument("--max_epoch", type=int, default=300,
                         help="number of training epochs")
     parser.add_argument("--warmup_steps", type=int, default=-1)
@@ -95,6 +102,13 @@ def build_args():
     parser.add_argument("--pooling", type=str, default="mean")
     parser.add_argument("--deg4feat", action="store_true", default=False, help="use node degree as input feature")
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="full",
+        choices=["full", "gmac_aug", "gamc_lrec", "gamc_lcon"],
+        help="Ablation mode: full GAMC or one of the three ablations",
+    )
     args = parser.parse_args()
     return args
 

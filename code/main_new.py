@@ -1,14 +1,16 @@
 import logging
+import os
 from tqdm import tqdm
 import numpy as np
 import torch
+import pandas as pd
 
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool
 
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.svm import SVC
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, accuracy_score
 
 from gamc.utils import (
     build_args,
@@ -22,6 +24,142 @@ from gamc.datasets.data_util import load_fake_news_graph_dataset
 from gamc.models import build_model
 import setproctitle
 setproctitle.setproctitle('yinshu')
+
+
+def resolve_amd_device(device_arg, backend="auto"):
+    backend = (backend or "auto").lower()
+
+    if backend == "cpu":
+        print("Using forced CPU backend")
+        return "cpu"
+
+    def _resolve_cuda_like(require_rocm=False):
+        if not torch.cuda.is_available():
+            return None
+
+        device_count = torch.cuda.device_count()
+        cuda_idx = device_arg if device_arg >= 0 else 0
+        if cuda_idx >= device_count:
+            raise RuntimeError(
+                f"Requested GPU index {cuda_idx}, but only {device_count} GPU(s) are available."
+            )
+
+        is_rocm = bool(getattr(torch.version, "hip", None))
+        if require_rocm and not is_rocm:
+            raise RuntimeError(
+                "ROCm backend requested but current torch build does not expose ROCm (torch.version.hip is None)."
+            )
+
+        gpu_name = torch.cuda.get_device_name(cuda_idx)
+        backend_name = "rocm" if is_rocm else "cuda"
+        print(f"Using {backend_name} device: {gpu_name} (cuda:{cuda_idx})")
+        return f"cuda:{cuda_idx}"
+
+    def _resolve_directml():
+        try:
+            import torch_directml
+        except ImportError:
+            return None
+
+        dml_idx = device_arg if device_arg >= 0 else 0
+        dml_device = torch_directml.device(dml_idx)
+        print(f"Using DirectML device index: {dml_idx}")
+        return dml_device
+
+    if backend == "rocm":
+        device = _resolve_cuda_like(require_rocm=True)
+        if device is None:
+            raise RuntimeError("ROCm backend requested, but no CUDA/ROCm runtime is available.")
+        return device
+
+    if backend == "cuda":
+        device = _resolve_cuda_like(require_rocm=False)
+        if device is None:
+            raise RuntimeError("CUDA backend requested, but no CUDA runtime is available.")
+        return device
+
+    if backend == "directml":
+        device = _resolve_directml()
+        if device is None:
+            raise RuntimeError(
+                "DirectML backend requested, but torch-directml is not installed. Install with: pip install torch-directml"
+            )
+        return device
+
+    if backend != "auto":
+        raise RuntimeError(f"Unsupported gpu backend: {backend}")
+
+    # auto priority: ROCm/CUDA first, then DirectML, then CPU fallback
+    device = _resolve_cuda_like(require_rocm=False)
+    if device is not None:
+        return device
+
+    device = _resolve_directml()
+    if device is not None:
+        return device
+
+    print("No ROCm/CUDA/DirectML runtime detected. Falling back to CPU.")
+    return "cpu"
+
+
+def apply_ablation_config(args):
+    ablation = getattr(args, "ablation", "full")
+
+    args.use_augmentation = True
+    args.use_reconstruction_loss = True
+    args.use_contrastive_loss = True
+    args.num_aug_views = 2
+
+    if ablation == "gmac_aug":
+        # Remove augmentation: no feature masking and no edge dropping.
+        args.use_augmentation = False
+        args.mask_rate = 0.0
+        args.drop_edge_rate = 0.0
+    elif ablation == "gamc_lrec":
+        # Contrastive-only optimization.
+        args.use_reconstruction_loss = False
+        args.use_contrastive_loss = True
+        args.num_aug_views = 2
+    elif ablation == "gamc_lcon":
+        # Reconstruction-only optimization with one augmented view.
+        args.use_reconstruction_loss = True
+        args.use_contrastive_loss = False
+        args.num_aug_views = 1
+
+    return args
+
+
+def save_ablation_results(dataset_name, ablation_name, seed_accs, seed_f1s):
+    results_dir = os.path.join("results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    rows = []
+    for idx, (acc, f1) in enumerate(zip(seed_accs, seed_f1s)):
+        rows.append(
+            {
+                "dataset": dataset_name,
+                "ablation": ablation_name,
+                "run": idx,
+                "accuracy": float(acc),
+                "f1_micro": float(f1),
+            }
+        )
+
+    rows.append(
+        {
+            "dataset": dataset_name,
+            "ablation": ablation_name,
+            "run": "mean",
+            "accuracy": float(np.mean(seed_accs)),
+            "f1_micro": float(np.mean(seed_f1s)),
+            "accuracy_std": float(np.std(seed_accs)),
+            "std": float(np.std(seed_f1s)),
+        }
+    )
+
+    out_csv = os.path.join(results_dir, f"ablation_{dataset_name}_{ablation_name}.csv")
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    print(f"Saved ablation results: {out_csv}")
 
 
 def graph_classification_evaluation(model, pooler, dataloader, num_classes, lr_f, weight_decay_f, max_epoch_f, device,
@@ -48,13 +186,15 @@ def graph_classification_evaluation(model, pooler, dataloader, num_classes, lr_f
             x_list.append(out.cpu().numpy())
     x = np.concatenate(x_list, axis=0)
     y = np.concatenate(y_list, axis=0)
-    test_f1, test_std = evaluate_graph_embeddings_using_svm(x, y)
+    test_acc, acc_std, test_f1, test_std = evaluate_graph_embeddings_using_svm(x, y)
+    print(f"#Test_acc: {test_acc:.4f}±{acc_std:.4f}")
     print(f"#Test_f1: {test_f1:.4f}±{test_std:.4f}")
-    return test_f1
+    return test_acc, test_f1
 
 
 def evaluate_graph_embeddings_using_svm(embeddings, labels):
-    result = []
+    result_acc = []
+    result_f1 = []
     kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=0)
 
     for train_index, test_index in kf.split(embeddings, labels):
@@ -68,12 +208,16 @@ def evaluate_graph_embeddings_using_svm(embeddings, labels):
         clf.fit(x_train, y_train)
 
         preds = clf.predict(x_test)
+        acc = accuracy_score(y_test, preds)
         f1 = f1_score(y_test, preds, average="micro")
-        result.append(f1)
-    test_f1 = np.mean(result)
-    test_std = np.std(result)
+        result_acc.append(acc)
+        result_f1.append(f1)
+    test_acc = np.mean(result_acc)
+    acc_std = np.std(result_acc)
+    test_f1 = np.mean(result_f1)
+    test_std = np.std(result_f1)
 
-    return test_f1, test_std
+    return test_acc, acc_std, test_f1, test_std
 
 
 def pretrain(model, pooler, dataloaders, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f,
@@ -108,7 +252,9 @@ def pretrain(model, pooler, dataloaders, optimizer, max_epoch, device, scheduler
 
 
 def main(args):
-    device = args.device if args.device >= 0 else "cpu"
+    args = apply_ablation_config(args)
+
+    device = resolve_amd_device(args.device, getattr(args, "gpu_backend", "auto"))
     seeds = args.seeds
     dataset_name = args.dataset
     feature = args.feature
@@ -135,6 +281,7 @@ def main(args):
     pooler = args.pooling
     deg4feat = args.deg4feat
     batch_size = args.batch_size
+    ablation_name = getattr(args, "ablation", "full")
 
     # graphs, (num_features, num_classes) = load_graph_classification_dataset(dataset_name, deg4feat=deg4feat)
     dataset, (num_features, num_classes) = load_fake_news_graph_dataset(dataset_name, feature, deg4feat=deg4feat)
@@ -146,8 +293,9 @@ def main(args):
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     acc_list = []
+    f1_list = []
     for i, seed in enumerate(seeds):
-        print(f"####### Run {i} for seed {seed}")
+        print(f"####### Run {i} for seed {seed} | ablation={ablation_name}")
         set_random_seed(seed)
 
         if logs:
@@ -178,18 +326,28 @@ def main(args):
             logging.info("Loading Model ... ")
             model.load_state_dict(torch.load("checkpoint.pt"))
         if save_model:
-            logging.info("Saveing Model ...")
-            torch.save(model.state_dict(), "checkpoint.pt")
+            checkpoints_dir = os.path.join("checkpoints")
+            os.makedirs(checkpoints_dir, exist_ok=True)
+            checkpoint_path = os.path.join(
+                checkpoints_dir,
+                f"checkpoint_{dataset_name}_{ablation_name}_seed{seed}.pt",
+            )
+            logging.info(f"Saving Model ... {checkpoint_path}")
+            torch.save(model.state_dict(), checkpoint_path)
 
         model = model.to(device)
         model.eval()
-        test_f1 = graph_classification_evaluation(model, pooler, eval_loader, num_classes, lr_f, weight_decay_f,
-                                                  max_epoch_f, device, mute=False)
-        acc_list.append(test_f1)
+        test_acc, test_f1 = graph_classification_evaluation(model, pooler, eval_loader, num_classes, lr_f, weight_decay_f,
+                                                            max_epoch_f, device, mute=False)
+        acc_list.append(test_acc)
+        f1_list.append(test_f1)
 
     final_acc, final_acc_std = np.mean(acc_list), np.std(acc_list)
+    final_f1, final_f1_std = np.mean(f1_list), np.std(f1_list)
     print(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
-    print(acc_list)
+    print(f"# final_f1: {final_f1:.4f}±{final_f1_std:.4f}")
+    print({"acc": acc_list, "f1": f1_list})
+    save_ablation_results(dataset_name, ablation_name, acc_list, f1_list)
 
 
 if __name__ == "__main__":
